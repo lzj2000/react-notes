@@ -1,4 +1,6 @@
 import { enableThrottledScheduling } from "../../shared/ReactFeatureFlags";
+import { createWorkInProgress } from "./ReactFiber";
+import { ensureRootIsScheduled } from "./ReactFiberRootScheduler";
 
 // 描述当前 React 执行栈的状态
 // ExecutionContext 是一个位掩码类型，用于标记当前 React 所处的执行阶段（如：是否在批量更新中、是否在合成事件处理中、是否在渲染阶段等）
@@ -822,4 +824,134 @@ function renderRootSync(
 
   // 返回渲染结束后的根节点状态（如 RootCompleted、RootSuspended、RootErrored 等）
   return exitStatus;
+}
+
+/**
+ * 在指定 Fiber 节点上调度更新的核心函数
+ * 
+ * @param {FiberRoot} root - 当前应用的 Fiber 根节点，所有更新最终关联到根节点调度
+ * @param {Fiber} fiber - 需要执行更新的目标 Fiber 节点（可能是组件 Fiber 或根 Fiber）
+ * @param {Lane} lane - 此次更新的优先级车道（Lane），用于控制调度优先级和执行顺序
+ */
+export function scheduleUpdateOnFiber(
+  root: FiberRoot,
+  fiber: Fiber,
+  lane: Lane,
+) {
+  // 场景1：处理「挂起状态」下的更新（渲染阶段挂起 或 提交阶段挂起）
+  // 若根节点处于工作中且因数据/操作挂起，或存在待取消的提交任务，需重置栈并标记挂起
+  if (
+    // 条件1：当前根节点是正在处理的工作根（workInProgressRoot），且挂起原因是「等待数据」或「等待操作」
+    (root === workInProgressRoot &&
+      (workInProgressSuspendedReason === SuspendedOnData ||
+        workInProgressSuspendedReason === SuspendedOnAction)) ||
+    // 条件2：根节点存在待取消的提交任务（提交阶段挂起，需中断当前提交）
+    root.cancelPendingCommit !== null
+  ) {
+    // 重置工作栈：清空当前的 workInProgress 树和相关状态，准备新的渲染
+    prepareFreshStack(root, NoLanes);
+    // 标记此次未尝试完整遍历树（因挂起中断）
+    const didAttemptEntireTree = false;
+    // 标记根节点为挂起状态，记录挂起相关的车道信息，避免重复调度无效更新
+    markRootSuspended(
+      root,
+      workInProgressRootRenderLanes,
+      workInProgressDeferredLane,
+      didAttemptEntireTree,
+    );
+  }
+
+  // 核心步骤：标记根节点已接收指定车道的更新，将 lane 加入根节点的 pendingLanes（待处理车道集）
+  // 后续调度会根据 pendingLanes 决定需要处理的更新优先级
+  markRootUpdated(root, lane);
+
+  // 分支1：当前处于「渲染阶段」（ExecutionContext 包含 RenderContext），且更新的根节点是当前工作根
+  // 说明更新是在渲染过程中触发的（如组件 render 中调用 setState），需特殊处理以避免循环渲染
+  if (
+    (executionContext & RenderContext) !== NoLanes &&
+    root === workInProgressRoot
+  ) {
+    // 开发环境警告：提醒在渲染阶段触发更新的潜在问题（可能导致性能问题或循环渲染）
+    warnAboutRenderPhaseUpdatesInDEV(fiber);
+
+    // 将当前更新的车道合并到「渲染阶段更新车道集」，延迟到当前渲染周期结束后处理
+    // 避免在同一渲染周期内重复处理同一优先级的更新
+    workInProgressRootRenderPhaseUpdatedLanes = mergeLanes(
+      workInProgressRootRenderPhaseUpdatedLanes,
+      lane,
+    );
+  } 
+  // 分支2：当前处于「非渲染阶段」（如事件回调、定时器等），正常调度更新
+  else {
+    // 若启用「更新器跟踪」特性，且存在 DevTools，将目标 Fiber 加入根节点的车道映射表
+    // 用于 DevTools 追踪更新来源（哪个 Fiber 触发了更新）
+    if (enableUpdaterTracking) {
+      if (isDevToolsPresent) {
+        addFiberToLanesMap(root, fiber, lane);
+      }
+    }
+
+    // 开发环境警告：若更新未被 act() 包裹（如测试环境外的异步更新），提醒可能导致状态不一致
+    warnIfUpdatesNotWrappedWithActDEV(fiber);
+
+    // 若启用「过渡追踪」特性，处理当前过渡（transition）与车道的关联
+    if (enableTransitionTracing) {
+      // 获取当前激活的过渡对象（ReactSharedInternals.T 存储全局过渡状态）
+      const transition = ReactSharedInternals.T;
+      // 若过渡存在且有名称（非匿名过渡），记录过渡的开始时间并关联到车道映射表
+      if (transition !== null && transition.name != null) {
+        if (transition.startTime === -1) {
+          transition.startTime = now(); // 初始化过渡开始时间（用于性能分析）
+        }
+        // 将过渡对象加入根节点的车道映射表，追踪过渡对应的更新车道
+        addTransitionToLanesMap(root, transition, lane);
+      }
+    }
+
+    // 子分支：当前根节点是工作根（workInProgressRoot），但处于非渲染阶段（如渲染被中断后重新调度）
+    if (root === workInProgressRoot) {
+      // 若当前执行上下文无 RenderContext（非渲染中），将车道合并到「交错更新车道集」
+      // 用于处理渲染中断后再次触发的更新，避免覆盖未完成的工作
+      if ((executionContext & RenderContext) === NoContext) {
+        workInProgressRootInterleavedUpdatedLanes = mergeLanes(
+          workInProgressRootInterleavedUpdatedLanes,
+          lane,
+        );
+      }
+      // 若当前根节点的退出状态是「延迟挂起」（RootSuspendedWithDelay），重新标记根节点为挂起
+      // 确保延迟挂起的更新不会被误调度，需等待延迟结束后再处理
+      if (workInProgressRootExitStatus === RootSuspendedWithDelay) {
+        const didAttemptEntireTree = false;
+        markRootSuspended(
+          root,
+          workInProgressRootRenderLanes,
+          workInProgressDeferredLane,
+          didAttemptEntireTree,
+        );
+      }
+    }
+
+    // 核心调度步骤：确保根节点已被调度（若未调度则创建调度任务）
+    // 内部会根据根节点的 pendingLanes 计算最高优先级，决定是否立即执行或延迟执行
+    ensureRootIsScheduled(root);
+
+    // 特殊处理：同步车道（SyncLane）的更新，且满足传统模式条件（非并发模式、无执行上下文）
+    // 用于兼容传统 React 模式（LegacyMode）下的同步更新，确保同步更新立即执行
+    if (
+      lane === SyncLane && // 当前更新是同步优先级（最高优先级，需立即处理）
+      executionContext === NoContext && // 无其他执行上下文（如非事件回调、非渲染中）
+      !disableLegacyMode && // 未禁用传统模式
+      (fiber.mode & ConcurrentMode) === NoMode // 目标 Fiber 不支持并发模式
+    ) {
+      // 开发环境：若处于传统批量更新中，不立即执行（等待批量结束）
+      if (__DEV__ && ReactSharedInternals.isBatchingLegacy) {
+        // 仅开发环境空分支，避免影响生产逻辑
+      } else {
+        // 重置渲染计时器（用于性能分析，标记同步更新开始）
+        resetRenderTimer();
+        // 仅在传统根节点上执行同步工作，确保同步更新立即渲染到 DOM
+        flushSyncWorkOnLegacyRootsOnly();
+      }
+    }
+  }
 }
